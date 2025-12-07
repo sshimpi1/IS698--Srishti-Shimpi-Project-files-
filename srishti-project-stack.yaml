@@ -1,0 +1,250 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: >
+  Full AWS 3-tier app for Srishti:
+  ALB + AutoScaling EC2 web tier + RDS MySQL (private) + S3 + Lambda S3 upload logger.
+Parameters:
+  VpcId:
+    Type: String
+    Description: VPC ID created by Terraform
+
+  PublicSubnet1Id:
+    Type: String
+    Description: Public subnet 1 ID (us-east-1a)
+
+  PublicSubnet2Id:
+    Type: String
+    Description: Public subnet 2 ID (us-east-1b)
+
+  PrivateSubnet1Id:
+    Type: String
+    Description: Private subnet 1 ID (us-east-1a)
+
+  PrivateSubnet2Id:
+    Type: String
+    Description: Private subnet 2 ID (us-east-1b)
+
+  WebSgId:
+    Type: String
+    Description: Web EC2 security group ID (allows 80 from ALB)
+
+  AlbSgId:
+    Type: String
+    Description: ALB security group ID (allows 80 from Internet)
+
+  DbSgId:
+    Type: String
+    Description: DB security group ID (allows 3306 from web SG)
+
+  KeyName:
+    Type: AWS::EC2::KeyPair::KeyName
+    Description: Existing EC2 key pair name
+
+  AmiId:
+    Type: String
+    Description: Amazon Linux 2023 AMI ID for us-east-1
+
+  DBUsername:
+    Type: String
+    Description: Master username for RDS
+
+  DBPassword:
+    NoEcho: true
+    Type: String
+    MinLength: 8
+    Description: Master password for RDS
+
+  S3BucketName:
+    Type: String
+    Description: Globally-unique S3 bucket name for uploads
+
+Resources:
+
+  # ------------------------ S3 Bucket ------------------------
+  ProjectBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Ref S3BucketName
+      NotificationConfiguration:
+        LambdaConfigurations:
+          - Event: "s3:ObjectCreated:*"
+            Function: !GetAtt S3UploadLogger.Arn
+
+  # ------------------------ Lambda for S3 Logging ------------------------
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Path: /
+
+  S3UploadLogger:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: srishti-s3-upload-logger
+      Runtime: python3.12
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 60
+      Code:
+        ZipFile: |
+          import json
+          import logging
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+
+          def lambda_handler(event, context):
+              logger.info("S3 Event: %s", json.dumps(event))
+              records = event.get("Records", [])
+              for r in records:
+                  bucket = r["s3"]["bucket"]["name"]
+                  key = r["s3"]["object"]["key"]
+                  size = r["s3"]["object"].get("size", 0)
+                  logger.info(f"New object in {bucket}: {key} ({size} bytes)")
+              return {"statusCode": 200, "body": "Logged S3 upload"}
+
+  S3InvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref S3UploadLogger
+      Principal: s3.amazonaws.com
+      SourceArn: !Sub "arn:aws:s3:::${S3BucketName}"
+
+  # ------------------------ IAM for EC2 ------------------------
+  WebServerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonS3ReadOnlyAccess
+
+  WebServerInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles:
+        - !Ref WebServerRole
+
+  # ------------------------ Launch Template + ASG ------------------------
+  WebLaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateData:
+        ImageId: !Ref AmiId
+        InstanceType: t2.micro
+        KeyName: !Ref KeyName
+        IamInstanceProfile:
+          Arn: !GetAtt WebServerInstanceProfile.Arn
+        SecurityGroupIds:
+          - !Ref WebSgId
+        UserData:
+          Fn::Base64: !Sub |
+            #!/bin/bash
+            yum update -y
+            yum install -y httpd
+            systemctl enable httpd
+            systemctl start httpd
+            echo "<h1>Hello from Srishti's Web App</h1>" > /var/www/html/index.html
+            echo "<p>ALB + EC2 AutoScaling + RDS + S3 + Lambda logging uploads.</p>" >> /var/www/html/index.html
+  WebAutoScalingGroup:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      MinSize: "1"
+      MaxSize: "2"
+      DesiredCapacity: "1"
+      VPCZoneIdentifier:
+        - !Ref PublicSubnet1Id
+        - !Ref PublicSubnet2Id
+      LaunchTemplate:
+        LaunchTemplateId: !Ref WebLaunchTemplate
+        Version: !GetAtt WebLaunchTemplate.LatestVersionNumber
+      TargetGroupARNs:
+        - !Ref WebTargetGroup
+
+  # ------------------------ ALB ------------------------
+  WebALB:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: srishti-web-alb
+      Scheme: internet-facing
+      Subnets:
+        - !Ref PublicSubnet1Id
+        - !Ref PublicSubnet2Id
+      SecurityGroups:
+        - !Ref AlbSgId
+
+  WebTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      VpcId: !Ref VpcId
+      Protocol: HTTP
+      Port: 80
+      TargetType: instance
+      HealthCheckPath: /
+      HealthCheckProtocol: HTTP
+
+  WebListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref WebALB
+      Port: 80
+      Protocol: HTTP
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref WebTargetGroup
+
+  # ------------------------ RDS MySQL ------------------------
+  DBSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupDescription: "Srishti project DB subnets"
+      SubnetIds:
+        - !Ref PrivateSubnet1Id
+        - !Ref PrivateSubnet2Id
+
+  RDSInstance:
+    Type: AWS::RDS::DBInstance
+    Properties:
+      Engine: mysql
+      EngineVersion: "8.0.43"
+      DBInstanceClass: db.t3.micro
+      AllocatedStorage: 20
+      DBName: projectdb
+      DBInstanceIdentifier: srishti-projectdb
+      MasterUsername: !Ref DBUsername
+      MasterUserPassword: !Ref DBPassword
+      VPCSecurityGroups:
+        - !Ref DbSgId
+      DBSubnetGroupName: !Ref DBSubnetGroup
+      PubliclyAccessible: false
+      DeletionProtection: false
+      MultiAZ: false
+
+Outputs:
+  ALBDNS:
+    Description: ALB DNS name
+    Value: !GetAtt WebALB.DNSName
+
+  RDSEndpoint:
+    Description: RDS endpoint
+    Value: !GetAtt RDSInstance.Endpoint.Address
+
+  BucketOut:
+    Description: S3 bucket name
+    Value: !Ref ProjectBucket
+
+  LambdaName:
+    Description: Lambda function name
+    Value: !Ref S3UploadLogger

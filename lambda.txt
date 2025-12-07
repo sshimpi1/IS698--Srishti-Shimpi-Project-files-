@@ -1,0 +1,14 @@
+import json
+import logging
+logger = logging.getLogger()
+logger.setLevel(logging.INFO)
+
+def lambda_handler(event, context):
+    logger.info("S3 Event: %s", json.dumps(event))
+    records = event.get("Records", [])
+    for r in records:
+        bucket = r["s3"]["bucket"]["name"]
+        key = r["s3"]["object"]["key"]
+        size = r["s3"]["object"].get("size", 0)
+        logger.info(f"New object in {bucket}: {key} ({size} bytes)")
+    return {"statusCode": 200, "body": "Logged S3 upload"}
